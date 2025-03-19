@@ -23,6 +23,8 @@ public class MessageQueueServer {
     // 日志工具实例，用于持久化状态变更记录
     private PersistentLogger logger;
 
+    private final Object opLock = new Object();
+
     private static boolean running = true; // 运行状态
 
     public static void main(String[] args) {
@@ -103,59 +105,75 @@ public class MessageQueueServer {
         String queueName = parts[1];
         switch (action) {
             case "PUBLISH":
-                if (parts.length < 3) {
-                    return "ERROR: PUBLISH 命令需要消息内容";
-                }
-                String message = parts[2];
-                // 如果队列不存在则自动创建
-                queues.computeIfAbsent(queueName, k -> {
-                    System.out.println("[INFO] 自动创建队列: " + k);
-                    return new LinkedBlockingQueue<>();
-                }).offer(message);
-                if (shouldLog) {
-                    logger.log(command);
-                }
-                System.out.println("[INFO] 消息已发布到队列 " + queueName + ": " + message);
-                return "OK: 消息已发布";
-
-            case "CONSUME":
-                LinkedBlockingQueue<String> queue = queues.get(queueName);
-                if (queue == null) {
-                    return "ERROR: 队列不存在";
-                }
-                String consumed = queue.poll();
-                if (consumed == null) {
-                    return "NO_MESSAGE";
-                }
-                if (shouldLog) {
-                    // 记录消费操作，确保重放时也删除对应消息
-                    logger.log(command);
-                }
-                System.out.println("[INFO] 消息从队列 " + queueName + " 被消费: " + consumed);
-                return "MESSAGE: " + consumed;
-
-            case "CREATE":
-                if (queues.containsKey(queueName)) {
-                    return "ERROR: 队列已存在";
-                } else {
-                    queues.put(queueName, new LinkedBlockingQueue<>());
+                synchronized (opLock) {
+                    if (parts.length < 3) {
+                        return "ERROR: PUBLISH 命令需要消息内容";
+                    }
+                    String message = parts[2];
+                    // 如果队列不存在则自动创建
+                    queues.computeIfAbsent(queueName, k -> {
+                        System.out.println("[INFO] 自动创建队列: " + k);
+                        return new LinkedBlockingQueue<>();
+                    }).offer(message);
+                    try {
+                        Thread.sleep(10000);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
                     if (shouldLog) {
                         logger.log(command);
                     }
-                    System.out.println("[INFO] 队列已创建: " + queueName);
-                    return "OK: 队列已创建";
+                    System.out.println("[INFO] 消息已发布到队列 " + queueName + ": " + message);
+                    return "OK: 消息已发布";
+                }
+
+            case "CONSUME":
+                synchronized (opLock) {
+                    LinkedBlockingQueue<String> queue = queues.get(queueName);
+                    if (queue == null) {
+                        return "ERROR: 队列不存在";
+                    }
+                    String consumed = queue.poll();
+                    if (consumed == null) {
+                        return "NO_MESSAGE";
+                    }
+                    if (shouldLog) {
+                        // 记录消费操作，确保重放时也删除对应消息
+                        logger.log(command);
+                    }
+                    System.out.println("[INFO] 消息从队列 " + queueName + " 被消费: " + consumed);
+                    return "MESSAGE: " + consumed;
+                }
+
+
+            case "CREATE":
+                synchronized (opLock) {
+                    if (queues.containsKey(queueName)) {
+                        return "ERROR: 队列已存在";
+                    } else {
+
+                        queues.put(queueName, new LinkedBlockingQueue<>());
+                        if (shouldLog) {
+                            logger.log(command);
+                        }
+
+                        System.out.println("[INFO] 队列已创建: " + queueName);
+                        return "OK: 队列已创建";
+                    }
                 }
 
             case "DROP":
-                if (!queues.containsKey(queueName)) {
-                    return "ERROR: 队列不存在";
-                } else {
-                    queues.remove(queueName);
-                    if (shouldLog) {
-                        logger.log(command);
+                synchronized (opLock) {
+                    if (!queues.containsKey(queueName)) {
+                        return "ERROR: 队列不存在";
+                    } else {
+                        queues.remove(queueName);
+                        if (shouldLog) {
+                            logger.log(command);
+                        }
+                        System.out.println("[INFO] 队列已删除: " + queueName);
+                        return "OK: 队列已删除";
                     }
-                    System.out.println("[INFO] 队列已删除: " + queueName);
-                    return "OK: 队列已删除";
                 }
 
             default:
@@ -205,7 +223,7 @@ public class MessageQueueServer {
          * 将记录写入日志文件
          * @param record 记录内容
          */
-        public synchronized void log(String record) {
+        public void log(String record) {
             String line = record + "\n";
             ByteBuffer buffer = ByteBuffer.wrap(line.getBytes(StandardCharsets.UTF_8));
             try {
