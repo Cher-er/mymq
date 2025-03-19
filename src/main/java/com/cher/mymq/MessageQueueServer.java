@@ -115,11 +115,6 @@ public class MessageQueueServer {
                         System.out.println("[INFO] 自动创建队列: " + k);
                         return new LinkedBlockingQueue<>();
                     }).offer(message);
-                    try {
-                        Thread.sleep(10000);
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
                     if (shouldLog) {
                         logger.log(command);
                     }
