@@ -1,4 +1,4 @@
-package com.cher.mymq;
+package com.cher.mymq.bio;
 
 import java.io.*;
 import java.net.Socket;

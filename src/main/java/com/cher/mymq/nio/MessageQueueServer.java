@@ -1,16 +1,16 @@
-package com.cher.mymq;
+package com.cher.mymq.nio;
 
 import java.net.*;
 import java.io.*;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
+import java.nio.CharBuffer;
+import java.nio.channels.*;
+import java.nio.charset.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
-import java.util.Collections;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.*;
 
 public class MessageQueueServer {
@@ -25,7 +25,7 @@ public class MessageQueueServer {
 
     private final Object opLock = new Object();
 
-    private static boolean running = true; // 运行状态
+    private static volatile boolean running = true; // 运行状态
 
     public static void main(String[] args) {
         MessageQueueServer server = new MessageQueueServer();
@@ -43,24 +43,55 @@ public class MessageQueueServer {
         }
     }
 
+    /**
+     * 使用 NIO 实现的服务器主循环
+     */
     public void start() {
-        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+        try {
+            // 打开 ServerSocketChannel，并设置为非阻塞模式
+            ServerSocketChannel serverChannel = ServerSocketChannel.open();
+            serverChannel.configureBlocking(false);
+            serverChannel.bind(new InetSocketAddress(PORT));
             System.out.println("[INFO] 消息队列服务端已启动，监听端口：" + PORT);
 
+            // 创建 Selector 以管理多个 Channel 的 IO 事件
+            Selector selector = Selector.open();
+            // 注册 ServerSocketChannel 的 OP_ACCEPT 事件
+            serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+
+            // 添加关闭钩子
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 System.out.println("收到退出信号，正在关闭 MessageQueueServer...");
                 stopServer();
             }));
 
-            // 持续监听客户端连接
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
-                System.out.println("[INFO] 接收到来自 " + clientSocket.getRemoteSocketAddress() + " 的连接");
-                // 为每个客户端连接开启新线程进行处理
-                new Thread(() -> handleClient(clientSocket)).start();
+            // 主循环：不断等待和处理 IO 事件
+            while (running) {
+                selector.select();
+                Iterator<SelectionKey> keyIterator = selector.selectedKeys().iterator();
+                while (keyIterator.hasNext()) {
+                    SelectionKey key = keyIterator.next();
+                    keyIterator.remove();
+
+                    if (!key.isValid()) {
+                        continue;
+                    }
+                    if (key.isAcceptable()) {
+                        accept(selector, key);
+                    }
+                    if (key.isReadable()) {
+                        read(key);
+                    }
+                    if (key.isWritable()) {
+                        write(key);
+                    }
+                }
             }
+            // 清理资源
+            selector.close();
+            serverChannel.close();
         } catch (IOException e) {
-            System.out.println("[ERROR] 服务器异常：" + e.getMessage());
+            System.out.println("[ERROR] 服务器异常: " + e.getMessage());
             e.printStackTrace();
         } finally {
             if (logger != null) {
@@ -69,30 +100,119 @@ public class MessageQueueServer {
         }
     }
 
-    private void handleClient(Socket socket) {
-        try (
-                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                PrintWriter out = new PrintWriter(socket.getOutputStream(), true)
-        ) {
-            String line;
-            // 持续读取客户端发送的命令
-            while ((line = in.readLine()) != null) {
+    /**
+     * 处理连接请求
+     */
+    private void accept(Selector selector, SelectionKey key) throws IOException {
+        ServerSocketChannel serverChannel = (ServerSocketChannel) key.channel();
+        SocketChannel clientChannel = serverChannel.accept();
+        if (clientChannel == null) {
+            return;
+        }
+        clientChannel.configureBlocking(false);
+        System.out.println("[INFO] 接收到来自 " + clientChannel.getRemoteAddress() + " 的连接");
+        // 为该连接创建一个 ClientContext，并注册读事件
+        ClientContext context = new ClientContext();
+        clientChannel.register(selector, SelectionKey.OP_READ, context);
+    }
+
+    /**
+     * 读取客户端发送的数据，并按行处理
+     */
+    private void read(SelectionKey key) {
+        SocketChannel channel = (SocketChannel) key.channel();
+        ClientContext context = (ClientContext) key.attachment();
+        ByteBuffer buffer = context.readBuffer;
+        int bytesRead = -1;
+        try {
+            bytesRead = channel.read(buffer);
+        } catch (IOException e) {
+            System.err.println("[ERROR] 读取客户端数据失败: " + e.getMessage());
+            closeChannel(key);
+            return;
+        }
+        if (bytesRead == -1) {
+            // 客户端关闭了连接
+            closeChannel(key);
+            return;
+        }
+        buffer.flip();
+        CharBuffer charBuffer;
+        try {
+            charBuffer = context.decoder.decode(buffer);
+        } catch (CharacterCodingException e) {
+            e.printStackTrace();
+            buffer.clear();
+            return;
+        }
+        String received = charBuffer.toString();
+        buffer.clear();
+
+        // 将读取的内容追加到累积缓冲区中
+        context.requestBuffer.append(received);
+        String data = context.requestBuffer.toString();
+        int index;
+        // 按换行符拆分完整的命令行
+        while ((index = data.indexOf("\n")) != -1) {
+            String line = data.substring(0, index).trim();
+            data = data.substring(index + 1);
+            if (!line.isEmpty()) {
                 System.out.println("[DEBUG] 收到命令: " + line);
-                // 对命令进行处理，同时将状态变更记录写入日志（参数 true）
                 String response = applyCommand(line, true);
                 System.out.println("[DEBUG] 响应命令: " + response);
-                out.println(response);
+                // 将响应入队，并设置写事件兴趣
+                context.enqueueResponse(response + "\n");
+                key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
             }
-            System.out.println("[INFO] 客户端 " + socket.getRemoteSocketAddress() + " 断开连接");
+        }
+        // 保存未处理的部分
+        context.requestBuffer.setLength(0);
+        context.requestBuffer.append(data);
+    }
+
+    /**
+     * 向客户端写入响应数据
+     */
+    private void write(SelectionKey key) {
+        SocketChannel channel = (SocketChannel) key.channel();
+        ClientContext context = (ClientContext) key.attachment();
+        Queue<ByteBuffer> queue = context.writeQueue;
+        try {
+            while (!queue.isEmpty()) {
+                ByteBuffer buf = queue.peek();
+                channel.write(buf);
+                if (buf.hasRemaining()) {
+                    // 未写完则退出，等待下次写事件
+                    break;
+                }
+                queue.poll();
+            }
+            if (queue.isEmpty()) {
+                // 写完后取消写事件兴趣
+                key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
+            }
         } catch (IOException e) {
-            System.out.println("[ERROR] 处理客户端 " + socket.getRemoteSocketAddress() + " 时异常：" + e.getMessage());
-            e.printStackTrace();
+            System.err.println("[ERROR] 写入客户端数据失败: " + e.getMessage());
+            closeChannel(key);
         }
     }
 
     /**
+     * 关闭客户端连接
+     */
+    private void closeChannel(SelectionKey key) {
+        try {
+            key.channel().close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        key.cancel();
+    }
+
+    /**
      * 解析并应用客户端或日志中的命令
-     * @param command 命令字符串（格式：PUBLISH/CONSUME/CREATE/DROP queueName [message]）
+     *
+     * @param command   命令字符串（格式：PUBLISH/CONSUME/CREATE/DROP queueName [message]）
      * @param shouldLog 是否记录该命令到日志（重放日志时传 false）
      * @return 操作结果响应
      */
@@ -121,7 +241,6 @@ public class MessageQueueServer {
                     System.out.println("[INFO] 消息已发布到队列 " + queueName + ": " + message);
                     return "OK: 消息已发布";
                 }
-
             case "CONSUME":
                 synchronized (opLock) {
                     LinkedBlockingQueue<String> queue = queues.get(queueName);
@@ -133,30 +252,24 @@ public class MessageQueueServer {
                         return "NO_MESSAGE";
                     }
                     if (shouldLog) {
-                        // 记录消费操作，确保重放时也删除对应消息
                         logger.log(command);
                     }
                     System.out.println("[INFO] 消息从队列 " + queueName + " 被消费: " + consumed);
                     return "MESSAGE: " + consumed;
                 }
-
-
             case "CREATE":
                 synchronized (opLock) {
                     if (queues.containsKey(queueName)) {
                         return "ERROR: 队列已存在";
                     } else {
-
                         queues.put(queueName, new LinkedBlockingQueue<>());
                         if (shouldLog) {
                             logger.log(command);
                         }
-
                         System.out.println("[INFO] 队列已创建: " + queueName);
                         return "OK: 队列已创建";
                     }
                 }
-
             case "DROP":
                 synchronized (opLock) {
                     if (!queues.containsKey(queueName)) {
@@ -170,7 +283,6 @@ public class MessageQueueServer {
                         return "OK: 队列已删除";
                     }
                 }
-
             default:
                 return "ERROR: 未知命令";
         }
@@ -197,8 +309,26 @@ public class MessageQueueServer {
 
     private static void stopServer() {
         running = false;
-        // 在这里添加持久化、清理资源等操作
         System.out.println("MessageQueueServer 退出成功");
+    }
+
+    /**
+     * 内部类：用于保存每个客户端连接的状态信息
+     */
+    private static class ClientContext {
+        // 读取缓冲区
+        ByteBuffer readBuffer = ByteBuffer.allocate(1024);
+        // 用于累积接收到的文本数据
+        StringBuilder requestBuffer = new StringBuilder();
+        // 待发送的响应队列
+        Queue<ByteBuffer> writeQueue = new LinkedList<>();
+        // 字符集解码器
+        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder();
+
+        void enqueueResponse(String response) {
+            ByteBuffer buf = ByteBuffer.wrap(response.getBytes(StandardCharsets.UTF_8));
+            writeQueue.offer(buf);
+        }
     }
 
     /**
@@ -214,10 +344,6 @@ public class MessageQueueServer {
             channel = FileChannel.open(logFilePath, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
         }
 
-        /**
-         * 将记录写入日志文件
-         * @param record 记录内容
-         */
         public void log(String record) {
             String line = record + "\n";
             ByteBuffer buffer = ByteBuffer.wrap(line.getBytes(StandardCharsets.UTF_8));
@@ -232,9 +358,6 @@ public class MessageQueueServer {
             }
         }
 
-        /**
-         * 关闭日志通道
-         */
         public void close() {
             try {
                 channel.close();
@@ -243,12 +366,6 @@ public class MessageQueueServer {
             }
         }
 
-        /**
-         * 读取日志文件中所有行
-         * @param filePath 日志文件路径
-         * @return 日志中每一行命令的列表
-         * @throws IOException 读取异常
-         */
         public static List<String> readLog(String filePath) throws IOException {
             Path path = Paths.get(filePath);
             if (!Files.exists(path)) {
