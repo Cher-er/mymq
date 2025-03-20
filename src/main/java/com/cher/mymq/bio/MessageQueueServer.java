@@ -48,10 +48,10 @@ public class MessageQueueServer {
     // 使用 ConcurrentHashMap 管理各个队列，每个队列使用 LinkedBlockingQueue 实现
     private ConcurrentHashMap<String, QueueHolder> queues = new ConcurrentHashMap<>();
 
+    private final ReentrantLock structureLock = new ReentrantLock();
+
     // 日志工具实例，用于持久化状态变更记录
     private PersistentLogger logger;
-
-    private final ReentrantLock structureLock = new ReentrantLock();
 
     private static boolean running = true; // 运行状态
 

@@ -12,20 +12,53 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class MessageQueueServer {
     private static final int PORT = 9999;
     private static final String LOG_FILE = "messagequeue.log";
 
+    public static class QueueHolder {
+        private final LinkedBlockingQueue<String> queue;
+        private final ReentrantReadWriteLock lock;
+
+        QueueHolder() {
+            this.queue = new LinkedBlockingQueue<>();
+            this.lock = new ReentrantReadWriteLock();
+        }
+
+        public boolean offer(String e) {
+            return queue.offer(e);
+        }
+
+        public String poll() {
+            return queue.poll();
+        }
+
+        public ReentrantReadWriteLock.WriteLock writeLock() {
+            return lock.writeLock();
+        }
+
+        public ReentrantReadWriteLock.ReadLock readLock() {
+            return lock.readLock();
+        }
+    }
+
     // 使用 ConcurrentHashMap 管理各个队列，每个队列使用 LinkedBlockingQueue 实现
-    private ConcurrentHashMap<String, LinkedBlockingQueue<String>> queues = new ConcurrentHashMap<>();
+    private ConcurrentHashMap<String, QueueHolder> queues = new ConcurrentHashMap<>();
+
+    private final ReentrantLock structureLock = new ReentrantLock();
 
     // 日志工具实例，用于持久化状态变更记录
     private PersistentLogger logger;
 
-    private final Object opLock = new Object();
-
     private static volatile boolean running = true; // 运行状态
+
+    // 工作线程池，用于处理业务逻辑（applyCommand）的任务
+    private ExecutorService workerPool = Executors.newFixedThreadPool(
+            Runtime.getRuntime().availableProcessors()
+    );
 
     public static void main(String[] args) {
         MessageQueueServer server = new MessageQueueServer();
@@ -80,9 +113,9 @@ public class MessageQueueServer {
                         accept(selector, key);
                     }
                     if (key.isReadable()) {
-                        read(key);
+                        read(selector, key);
                     }
-                    if (key.isWritable()) {
+                    if (key.isValid() && key.isWritable()) {
                         write(key);
                     }
                 }
@@ -119,7 +152,7 @@ public class MessageQueueServer {
     /**
      * 读取客户端发送的数据，并按行处理
      */
-    private void read(SelectionKey key) {
+    private void read(Selector selector, SelectionKey key) {
         SocketChannel channel = (SocketChannel) key.channel();
         ClientContext context = (ClientContext) key.attachment();
         ByteBuffer buffer = context.readBuffer;
@@ -158,11 +191,21 @@ public class MessageQueueServer {
             data = data.substring(index + 1);
             if (!line.isEmpty()) {
                 System.out.println("[DEBUG] 收到命令: " + line);
-                String response = applyCommand(line, true);
-                System.out.println("[DEBUG] 响应命令: " + response);
-                // 将响应入队，并设置写事件兴趣
-                context.enqueueResponse(response + "\n");
-                key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+                // 提交到工作线程池异步处理
+                final String command = line;
+                final SelectionKey currentKey = key;
+                workerPool.submit(() -> {
+                    String response = applyCommand(command, true);
+                    System.out.println("[DEBUG] 响应命令: " + response);
+                    // 将响应入队，并设置写事件兴趣
+                    synchronized (context) {
+                        context.enqueueResponse(response + "\n");
+                    }
+                    currentKey.interestOps(currentKey.interestOps() | SelectionKey.OP_WRITE);
+                    // 唤醒阻塞的 select() 调用
+                    selector.wakeup();
+                });
+
             }
         }
         // 保存未处理的部分
@@ -223,68 +266,106 @@ public class MessageQueueServer {
         }
         String action = parts[0].toUpperCase();
         String queueName = parts[1];
+
         switch (action) {
-            case "PUBLISH":
-                synchronized (opLock) {
-                    if (parts.length < 3) {
-                        return "ERROR: PUBLISH 命令需要消息内容";
+            case "PUBLISH" -> {
+                if (parts.length < 3) {
+                    return "ERROR: PUBLISH 命令需要消息内容";
+                }
+                QueueHolder queue = queues.get(queueName);
+                if (queue == null) {
+                    structureLock.lock();
+                    try {
+                        if (!queues.containsKey(queueName)) {
+                            queues.put(queueName, new QueueHolder());
+                            System.out.println("[INFO] 自动创建队列: " + queueName);
+                        }
+                        queue = queues.get(queueName);
+
+                    } finally {
+                        structureLock.unlock();
                     }
+                }
+                queue.writeLock().lock();
+                try {
                     String message = parts[2];
                     // 如果队列不存在则自动创建
-                    queues.computeIfAbsent(queueName, k -> {
-                        System.out.println("[INFO] 自动创建队列: " + k);
-                        return new LinkedBlockingQueue<>();
-                    }).offer(message);
+                    queue.offer(message);
                     if (shouldLog) {
                         logger.log(command);
                     }
                     System.out.println("[INFO] 消息已发布到队列 " + queueName + ": " + message);
                     return "OK: 消息已发布";
+                } finally {
+                    queue.writeLock().unlock();
                 }
-            case "CONSUME":
-                synchronized (opLock) {
-                    LinkedBlockingQueue<String> queue = queues.get(queueName);
-                    if (queue == null) {
-                        return "ERROR: 队列不存在";
-                    }
+            }
+            case "CONSUME" -> {
+                QueueHolder queue = queues.get(queueName);
+                if (queue == null) {
+                    return "ERROR: 队列不存在";
+                }
+                queue.writeLock().lock();
+                try {
                     String consumed = queue.poll();
                     if (consumed == null) {
                         return "NO_MESSAGE";
                     }
                     if (shouldLog) {
+                        // 记录消费操作，确保重放时也删除对应消息
                         logger.log(command);
                     }
                     System.out.println("[INFO] 消息从队列 " + queueName + " 被消费: " + consumed);
                     return "MESSAGE: " + consumed;
+                } finally {
+                    queue.writeLock().unlock();
                 }
-            case "CREATE":
-                synchronized (opLock) {
+            }
+            case "CREATE" -> {
+                structureLock.lock();
+                try {
                     if (queues.containsKey(queueName)) {
                         return "ERROR: 队列已存在";
-                    } else {
-                        queues.put(queueName, new LinkedBlockingQueue<>());
-                        if (shouldLog) {
-                            logger.log(command);
-                        }
-                        System.out.println("[INFO] 队列已创建: " + queueName);
-                        return "OK: 队列已创建";
                     }
+
+                    queues.put(queueName, new QueueHolder());
+                    if (shouldLog) {
+                        logger.log(command);
+                    }
+
+                    System.out.println("[INFO] 队列已创建: " + queueName);
+                    return "OK: 队列已创建";
+
+                } finally {
+                    structureLock.unlock();
                 }
-            case "DROP":
-                synchronized (opLock) {
-                    if (!queues.containsKey(queueName)) {
+            }
+            case "DROP" -> {
+                structureLock.lock();
+                try {
+                    QueueHolder queue = queues.get(queueName);
+                    if (queue == null) {
                         return "ERROR: 队列不存在";
                     } else {
-                        queues.remove(queueName);
-                        if (shouldLog) {
-                            logger.log(command);
+                        queue.writeLock().lock();
+                        try {
+                            queues.remove(queueName);
+                            if (shouldLog) {
+                                logger.log(command);
+                            }
+                            System.out.println("[INFO] 队列已删除: " + queueName);
+                            return "OK: 队列已删除";
+                        } finally {
+                            queue.writeLock().unlock();
                         }
-                        System.out.println("[INFO] 队列已删除: " + queueName);
-                        return "OK: 队列已删除";
                     }
+                } finally {
+                    structureLock.unlock();
                 }
-            default:
+            }
+            default -> {
                 return "ERROR: 未知命令";
+            }
         }
     }
 

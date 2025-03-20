@@ -16,8 +16,8 @@ public class MessageQueuePerformanceTest {
     private static final String SERVER_HOST = "localhost";
     private static final int SERVER_PORT = 9999;
     private static final String QUEUE_NAME = "test_queue";
-    private static final int NUM_PUBLISHER_THREADS = 30;
-    private static final int NUM_CONSUMER_THREADS = 30;
+    private static final int NUM_PUBLISHER_THREADS = 20;
+    private static final int NUM_CONSUMER_THREADS = 20;
     private static final int MESSAGES_PER_PUBLISHER = 1000;
     private static final int THREADS_NUM_PER_QUEUE = 10;
 
