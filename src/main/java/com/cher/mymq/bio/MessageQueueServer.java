@@ -12,18 +12,46 @@ import java.nio.file.StandardOpenOption;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class MessageQueueServer {
     private static final int PORT = 9999;
     private static final String LOG_FILE = "messagequeue.log";
 
+    public static class QueueHolder {
+        private final LinkedBlockingQueue<String> queue;
+        private final ReentrantReadWriteLock lock;
+
+        QueueHolder() {
+            this.queue = new LinkedBlockingQueue<>();
+            this.lock = new ReentrantReadWriteLock();
+        }
+
+        public boolean offer(String e) {
+            return queue.offer(e);
+        }
+
+        public String poll() {
+            return queue.poll();
+        }
+
+        public ReentrantReadWriteLock.WriteLock writeLock() {
+            return lock.writeLock();
+        }
+
+        public ReentrantReadWriteLock.ReadLock readLock() {
+            return lock.readLock();
+        }
+    }
+
     // 使用 ConcurrentHashMap 管理各个队列，每个队列使用 LinkedBlockingQueue 实现
-    private ConcurrentHashMap<String, LinkedBlockingQueue<String>> queues = new ConcurrentHashMap<>();
+    private ConcurrentHashMap<String, QueueHolder> queues = new ConcurrentHashMap<>();
 
     // 日志工具实例，用于持久化状态变更记录
     private PersistentLogger logger;
 
-    private final Object opLock = new Object();
+    private final ReentrantLock structureLock = new ReentrantLock();
 
     private static boolean running = true; // 运行状态
 
@@ -92,7 +120,8 @@ public class MessageQueueServer {
 
     /**
      * 解析并应用客户端或日志中的命令
-     * @param command 命令字符串（格式：PUBLISH/CONSUME/CREATE/DROP queueName [message]）
+     *
+     * @param command   命令字符串（格式：PUBLISH/CONSUME/CREATE/DROP queueName [message]）
      * @param shouldLog 是否记录该命令到日志（重放日志时传 false）
      * @return 操作结果响应
      */
@@ -103,31 +132,47 @@ public class MessageQueueServer {
         }
         String action = parts[0].toUpperCase();
         String queueName = parts[1];
+
         switch (action) {
-            case "PUBLISH":
-                synchronized (opLock) {
-                    if (parts.length < 3) {
-                        return "ERROR: PUBLISH 命令需要消息内容";
+            case "PUBLISH" -> {
+                if (parts.length < 3) {
+                    return "ERROR: PUBLISH 命令需要消息内容";
+                }
+                QueueHolder queue = queues.get(queueName);
+                if (queue == null) {
+                    structureLock.lock();
+                    try {
+                        if (!queues.containsKey(queueName)) {
+                            queues.put(queueName, new QueueHolder());
+                            System.out.println("[INFO] 自动创建队列: " + queueName);
+                        }
+                        queue = queues.get(queueName);
+
+                    } finally {
+                        structureLock.unlock();
                     }
+                }
+                queue.writeLock().lock();
+                try {
                     String message = parts[2];
                     // 如果队列不存在则自动创建
-                    queues.computeIfAbsent(queueName, k -> {
-                        System.out.println("[INFO] 自动创建队列: " + k);
-                        return new LinkedBlockingQueue<>();
-                    }).offer(message);
+                    queue.offer(message);
                     if (shouldLog) {
                         logger.log(command);
                     }
                     System.out.println("[INFO] 消息已发布到队列 " + queueName + ": " + message);
                     return "OK: 消息已发布";
+                } finally {
+                    queue.writeLock().unlock();
                 }
-
-            case "CONSUME":
-                synchronized (opLock) {
-                    LinkedBlockingQueue<String> queue = queues.get(queueName);
-                    if (queue == null) {
-                        return "ERROR: 队列不存在";
-                    }
+            }
+            case "CONSUME" -> {
+                QueueHolder queue = queues.get(queueName);
+                if (queue == null) {
+                    return "ERROR: 队列不存在";
+                }
+                queue.writeLock().lock();
+                try {
                     String consumed = queue.poll();
                     if (consumed == null) {
                         return "NO_MESSAGE";
@@ -138,41 +183,55 @@ public class MessageQueueServer {
                     }
                     System.out.println("[INFO] 消息从队列 " + queueName + " 被消费: " + consumed);
                     return "MESSAGE: " + consumed;
+                } finally {
+                    queue.writeLock().unlock();
                 }
-
-
-            case "CREATE":
-                synchronized (opLock) {
+            }
+            case "CREATE" -> {
+                structureLock.lock();
+                try {
                     if (queues.containsKey(queueName)) {
                         return "ERROR: 队列已存在";
-                    } else {
-
-                        queues.put(queueName, new LinkedBlockingQueue<>());
-                        if (shouldLog) {
-                            logger.log(command);
-                        }
-
-                        System.out.println("[INFO] 队列已创建: " + queueName);
-                        return "OK: 队列已创建";
                     }
-                }
 
-            case "DROP":
-                synchronized (opLock) {
-                    if (!queues.containsKey(queueName)) {
+                    queues.put(queueName, new QueueHolder());
+                    if (shouldLog) {
+                        logger.log(command);
+                    }
+
+                    System.out.println("[INFO] 队列已创建: " + queueName);
+                    return "OK: 队列已创建";
+
+                } finally {
+                    structureLock.unlock();
+                }
+            }
+            case "DROP" -> {
+                structureLock.lock();
+                try {
+                    QueueHolder queue = queues.get(queueName);
+                    if (queue == null) {
                         return "ERROR: 队列不存在";
                     } else {
-                        queues.remove(queueName);
-                        if (shouldLog) {
-                            logger.log(command);
+                        queue.writeLock().lock();
+                        try {
+                            queues.remove(queueName);
+                            if (shouldLog) {
+                                logger.log(command);
+                            }
+                            System.out.println("[INFO] 队列已删除: " + queueName);
+                            return "OK: 队列已删除";
+                        } finally {
+                            queue.writeLock().unlock();
                         }
-                        System.out.println("[INFO] 队列已删除: " + queueName);
-                        return "OK: 队列已删除";
                     }
+                } finally {
+                    structureLock.unlock();
                 }
-
-            default:
+            }
+            default -> {
                 return "ERROR: 未知命令";
+            }
         }
     }
 
@@ -216,6 +275,7 @@ public class MessageQueueServer {
 
         /**
          * 将记录写入日志文件
+         *
          * @param record 记录内容
          */
         public void log(String record) {
@@ -245,6 +305,7 @@ public class MessageQueueServer {
 
         /**
          * 读取日志文件中所有行
+         *
          * @param filePath 日志文件路径
          * @return 日志中每一行命令的列表
          * @throws IOException 读取异常
