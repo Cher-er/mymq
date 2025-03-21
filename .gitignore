@@ -6,6 +6,9 @@ target/
 ### Log File ###
 messagequeue.log
 
+### Performance Report ###
+report/
+
 ### IntelliJ IDEA ###
 .idea/modules.xml
 .idea/jarRepositories.xml
