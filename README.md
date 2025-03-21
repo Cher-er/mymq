@@ -8,8 +8,9 @@ MQ Server 单机应用，通过追加日志实现持久化
 
 MQ Server 分布式应用，实现简单的主从部署
 
-- distributed.master：MQ Server 主节点
-- distributed.slave：MQ Server 从节点
+- distributed.master：MQ Server 主节点，向从节点推送日志
+- distributed.slave：MQ Server 从节点，接收主节点日志消息
+- distributed.sentinel：哨兵节点，周期性检查主节点状态，主节点宕机后，选举某个从节点
 
 
 
@@ -76,4 +77,6 @@ MQ Server 分布式应用，实现简单的主从部署
    }
    ```
 
-   
+4. 主节点宕机后，存在一个 “从节点重连接” 的过程。按照现在将游标存储在主节点的方式，主节点宕机会丢失游标，导致从节点重连后无法确认自己的日志位置。
+
+   考虑是否可以在从节点中存储最新的游标位置。
